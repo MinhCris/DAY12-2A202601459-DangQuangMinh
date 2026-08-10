@@ -3,7 +3,7 @@
 > **Bài làm cá nhân.** Trả lời bằng lời của chính bạn, dựa trên những gì bạn
 > quan sát được khi chạy code — không sao chép đáp án của người khác.
 >
-> Cách trả lời: thay dòng `> *Câu trả lời của bạn*` bằng câu trả lời.
+> Cách trả lời: thay dòng placeholder in nghiêng dưới mỗi câu bằng câu trả lời.
 > `grade.py` đếm số câu đã trả lời (15 điểm cho 10 câu).
 >
 > Họ và tên: Đặng Quang Minh  Mã học viên: 2A202601459
@@ -369,4 +369,113 @@ Ghi lại **một** lỗi bạn gặp khi deploy lên cloud (build fail, health 
 timeout, sai REDIS_URL, app không đọc `$PORT`...): thông báo lỗi là gì, bạn
 tìm ra nguyên nhân bằng cách nào, và sửa ra sao?
 
-> *Câu trả lời của bạn*
+Lỗi: **health check timeout** trên Railway, mà nguyên nhân thật lại là app
+không đọc được `$PORT`.
+
+**Triệu chứng.** Deploy lên Railway (project `confident-truth`, build từ
+Dockerfile), build chạy trót lọt tới tận `image push` rồi hỏng ở bước cuối:
+
+```
+====================
+Starting Healthcheck
+====================
+Path: /health
+Retry window: 30s
+
+Attempt #1 failed with service unavailable. Continuing to retry for 19s
+Attempt #2 failed with service unavailable. Continuing to retry for 8s
+
+1/1 replicas never became healthy!
+Healthcheck failed!
+```
+
+**Tìm nguyên nhân.** Điều đầu tiên là tách "build hỏng" khỏi "chạy hỏng", vì
+hai loại lỗi này sửa ở hai chỗ khác nhau. Mình đọc log build trước:
+
+```bash
+railway logs --build 36556495-ca85-4bd9-aaf4-30e9d019420f
+```
+
+Log build chạy hết cả 6 layer của stage `runtime` rồi `exporting to docker
+image format` → `image push`. Không có lỗi. Vậy image build ra được, vấn đề
+nằm ở lúc chạy. Đổi sang log runtime:
+
+```bash
+railway logs --deployment 36556495-ca85-4bd9-aaf4-30e9d019420f
+```
+
+Và nó hiện ra ngay, lặp lại 4 lần liền:
+
+```
+Starting Container
+Usage: uvicorn [OPTIONS] APP
+Try 'uvicorn --help' for help.
+
+Error: Invalid value for '--port': '$PORT' is not a valid integer.
+Stopping Container
+```
+
+Chuỗi `'$PORT'` nằm trong dấu nháy của thông báo lỗi là chi tiết quyết định:
+uvicorn nhận được đúng **6 ký tự `$PORT`** chứ không phải một con số. Nghĩa là
+không ai khai triển biến này cả.
+
+Chỗ khó hiểu lúc đó: `CMD` trong Dockerfile mình viết đúng rồi mà —
+
+```dockerfile
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+```
+
+Có `sh -c` nên `${PORT:-8000}` chắc chắn được khai triển. Nhưng đối chiếu lại
+thông báo lỗi thì lệnh đang chạy lại là `--port $PORT`, không phải
+`--port ${PORT:-8000}`. Hai lệnh khác nhau → lệnh đang chạy **không phải** CMD
+của Dockerfile. Mở `railway.toml` thì thấy thủ phạm:
+
+```toml
+[deploy]
+startCommand = "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+```
+
+Hai điều cộng lại thành lỗi: (1) `startCommand` trong `railway.toml` **ghi đè**
+`CMD` của image, nên `CMD` mình viết cẩn thận không hề được dùng; (2) Railway
+chạy `startCommand` theo dạng exec, **không qua shell**, mà khai triển biến
+`$PORT` vốn là việc của shell — không có shell thì `$PORT` chỉ là văn bản
+thường được truyền thẳng làm tham số.
+
+**Sửa.** Tự gọi shell trong chính `startCommand`, và giữ giá trị dự phòng để
+lệnh vẫn chạy được cả khi platform chưa gán `PORT`:
+
+```toml
+# trước — hỏng
+startCommand = "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+
+# sau — chạy được
+startCommand = "sh -c 'uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}'"
+```
+
+Deploy lại, service lên `● Online` và health check qua ngay:
+
+```
+GET /health → HTTP/2 200  {"status":"ok","service":"day12-agent","version":"1.0.0"}
+GET /ready  → HTTP/2 200  {"status":"ready","redis":true}
+```
+
+**Hai điều rút ra.**
+
+Thứ nhất, *"chạy được ở máy"* và *"chạy được trên cloud"* có thể hỏng ở đúng
+chỗ mình tưởng là an toàn nhất. `docker compose up` ở máy chạy `CMD` của
+Dockerfile nên không bao giờ lộ lỗi này; chỉ trên Railway — nơi có
+`startCommand` đè lên — nó mới xuất hiện. Cấu hình riêng của từng platform là
+một bề mặt lỗi mà test ở máy không chạm tới được.
+
+Thứ hai, "health check timeout" gần như không bao giờ là lỗi của health check.
+Nó chỉ nói *"không ai trả lời cổng đó"*, còn lý do thật nằm trong log runtime.
+Nếu lúc đó mình đi tăng `healthcheckTimeout` từ 30s lên 120s cho "chắc" thì chỉ
+đổi được thời gian chờ trước khi nhận cùng một thất bại. Thứ tự đọc log —
+build trước, runtime sau — là thứ cắt được nửa số khả năng ngay từ bước đầu.
+
+Một điểm nữa mình sửa cùng lúc: project khi đó chưa có Redis và service chưa
+được set biến môi trường nào. Đã tạo Redis bằng `railway add --database redis`,
+trỏ `REDIS_URL` sang tham chiếu `${{Redis.REDIS_URL}}` thay vì dán URL cứng (để
+Railway đổi endpoint thì mình không phải sửa lại), và set `AGENT_API_KEY` bằng
+`railway variables --set-from-stdin` để giá trị không đi qua tham số dòng lệnh
+— tham số dòng lệnh bị lưu vào shell history và hiện ra trong `ps`.

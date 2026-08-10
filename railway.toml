@@ -10,7 +10,11 @@ builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+# Phải bọc trong `sh -c`: Railway chạy startCommand KHÔNG qua shell, nên viết
+# thẳng `--port $PORT` thì uvicorn nhận đúng chuỗi "$PORT" và chết với
+# `Invalid value for '--port': '$PORT' is not a valid integer`.
+# `${PORT:-8000}` để vẫn chạy được cả khi platform chưa gán PORT.
+startCommand = "sh -c 'uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}'"
 healthcheckPath = "/health"
 healthcheckTimeout = 30
 restartPolicyType = "on_failure"
