@@ -77,32 +77,36 @@ class AskRequest(BaseModel):
 def health():
     """Liveness probe — process còn sống không?
 
-    TODO (CP1 + CP4):
-      - Đang tắt dần (``lifecycle.shutting_down``) → trả
-        ``JSONResponse(status_code=503, content={"status": "shutting_down"})``
-      - Bình thường → ``{"status": "ok", "service": SERVICE_NAME,
-        "version": SERVICE_VERSION}`` (mặc định FastAPI trả 200).
-
-    Endpoint này phải **nhẹ**: không gọi Redis, không query DB. Nó chỉ trả
-    lời câu hỏi "có cần restart container này không?". Nếu nó phụ thuộc
-    Redis, Redis chết một nhịp là cả cụm container bị restart theo.
+    Endpoint này phải **nhẹ**: không gọi Redis, không query DB (vì vậy hàm
+    không nhận một ``Depends`` nào). Nó chỉ trả lời câu hỏi "có cần restart
+    container này không?". Nếu nó phụ thuộc Redis, Redis chết một nhịp là cả
+    cụm container bị restart theo.
     """
-    raise NotImplementedError("TODO (CP1/CP4): cài đặt /health")
+    if lifecycle.shutting_down:
+        # 503 để load balancer rút instance này ra khỏi vòng xoay TRƯỚC khi
+        # process thật sự thoát — không request nào bị cắt giữa chừng.
+        return JSONResponse(status_code=503, content={"status": "shutting_down"})
+
+    return {"status": "ok", "service": SERVICE_NAME, "version": SERVICE_VERSION}
 
 
 @app.get("/ready")
 def ready(store: ConversationStore = Depends(get_store)):
     """Readiness probe — đã sẵn sàng nhận traffic chưa?
 
-    TODO (CP4):
-      - Đang tắt dần → 503 ``{"status": "shutting_down"}``
-      - ``store.ping()`` False → 503 ``{"status": "not ready", "redis": False}``
-      - Ngược lại → ``{"status": "ready", "redis": True}``
-
     Khác /health ở chỗ: endpoint này ĐƯỢC PHÉP kiểm tra dependency. Load
-    balancer dùng nó để quyết định có đẩy request vào instance này không.
+    balancer dùng nó để quyết định có đẩy request vào instance này không —
+    503 ở đây nghĩa là "ngừng gửi request", không phải "restart tôi đi".
     """
-    raise NotImplementedError("TODO (CP4): cài đặt /ready")
+    if lifecycle.shutting_down:
+        return JSONResponse(status_code=503, content={"status": "shutting_down"})
+
+    if not store.ping():
+        return JSONResponse(
+            status_code=503, content={"status": "not ready", "redis": False}
+        )
+
+    return {"status": "ready", "redis": True}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -118,34 +122,39 @@ def ask(
 ):
     """Hỏi agent một câu.
 
-    TODO (CP3 + CP4) — làm ĐÚNG THỨ TỰ sau:
-      1. ``limiter.check(user_id)``           → 429 nếu gọi quá nhanh
-      2. ``guard.check(user_id)``             → 402 nếu hết ngân sách
-      3. ``history = store.get_history(user_id)``
-      4. ``result = ask_llm(payload.question, history)``
-      5. ``store.append(user_id, "user", payload.question)`` và
-         ``store.append(user_id, "assistant", result["answer"])``
-      6. ``guard.record(user_id, result["cost_usd"])``
-      7. ``log_event("ask_completed", user_id=user_id,
-         tokens_in=result["tokens_in"], tokens_out=result["tokens_out"],
-         cost_usd=result["cost_usd"])``
-      8. trả về::
-
-            {
-                "answer": result["answer"],
-                "user_id": user_id,
-                "history_length": len(history),
-                "cost_usd": result["cost_usd"],
-                "tokens": {"in": result["tokens_in"], "out": result["tokens_out"]},
-            }
-
     Vì sao check trước rồi mới gọi LLM? Vì tiền mất ở bước gọi LLM. Chặn sau
     khi đã gọi thì bạn vừa trả tiền vừa trả lỗi.
 
     ``user_id`` do ``verify_api_key`` trả về, nên request không có API key
     hợp lệ sẽ dừng ở 401 trước khi chạm vào bất cứ dòng nào ở đây.
     """
-    raise NotImplementedError("TODO (CP3/CP4): cài đặt /ask")
+    # Hai lớp chặn, đặt TRƯỚC lời gọi LLM
+    limiter.check(user_id)  # 429 — gọi quá nhanh
+    guard.check(user_id)  # 402 — hết ngân sách tháng
+
+    history = store.get_history(user_id)
+    result = ask_llm(payload.question, history)
+
+    store.append(user_id, "user", payload.question)
+    store.append(user_id, "assistant", result["answer"])
+    guard.record(user_id, result["cost_usd"])
+
+    log_event(
+        "ask_completed",
+        user_id=user_id,
+        tokens_in=result["tokens_in"],
+        tokens_out=result["tokens_out"],
+        cost_usd=result["cost_usd"],
+    )
+
+    return {
+        "answer": result["answer"],
+        "user_id": user_id,
+        # Độ dài lịch sử TRƯỚC lượt này — cho thấy agent nhớ được bao nhiêu
+        "history_length": len(history),
+        "cost_usd": result["cost_usd"],
+        "tokens": {"in": result["tokens_in"], "out": result["tokens_out"]},
+    }
 
 
 if __name__ == "__main__":

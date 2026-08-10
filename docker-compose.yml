@@ -4,15 +4,15 @@
 # Service `redis` đã cho sẵn — chạy ngay từ Block 1 để có Redis mà code:
 #     docker compose up -d redis
 #
-# NHIỆM VỤ: bổ sung service `agent`. Yêu cầu:
-#   [ ] build từ Dockerfile trong thư mục hiện tại
-#   [ ] map cổng ra ngoài (8000:8000)
-#   [ ] KHÔNG viết secret thẳng vào file này — dùng nội suy biến môi trường
-#       `${AGENT_API_KEY}` (docker compose tự đọc từ file .env cùng thư mục)
-#   [ ] REDIS_URL trỏ tới `redis://redis:6379/0` — trong compose, tên service
+# Service `agent` (đã làm):
+#   [x] build từ Dockerfile trong thư mục hiện tại
+#   [x] map cổng ra ngoài
+#   [x] KHÔNG viết secret thẳng vào file này — nội suy `${AGENT_API_KEY}`
+#       (docker compose tự đọc từ file .env cùng thư mục)
+#   [x] REDIS_URL trỏ tới `redis://redis:6379/0` — trong compose, tên service
 #       chính là hostname
-#   [ ] depends_on: redis
-#   [ ] healthcheck gọi /health
+#   [x] depends_on: redis
+#   [x] healthcheck gọi /health
 #
 # ĐIỂM CỘNG: thêm service `nginx` làm load balancer (nginx/nginx.conf đã có sẵn)
 #     docker compose up --scale agent=3
@@ -34,10 +34,54 @@ services:
       timeout: 3s
       retries: 5
 
-  # TODO (CP2): khai báo service `agent` ở đây
-  # agent:
-  #   build: .
-  #   ...
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Dải cổng thay vì "8000:8000" để `--scale agent=3` không đụng cổng:
+    # 1 replica → host 8000, 3 replica → host 8000, 8001, 8002.
+    ports:
+      - "8000-8002:8000"
+    environment:
+      # Nội suy từ file .env cùng thư mục — KHÔNG viết thẳng khóa vào đây,
+      # file này được commit lên repo.
+      AGENT_API_KEY: ${AGENT_API_KEY}
+      # `redis` là tên service, và trong compose tên service chính là
+      # hostname. Dùng localhost ở đây là trỏ vào chính container agent.
+      REDIS_URL: redis://redis:6379/0
+      PORT: 8000
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-10}
+      MONTHLY_BUDGET_USD: ${MONTHLY_BUDGET_USD:-10.0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()"
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # ĐIỂM CỘNG — load balancer cho nhiều instance agent:
+  #     docker compose up -d --scale agent=3
+  #     curl http://localhost/health
+  # Docker DNS trả về cả 3 IP cho hostname `agent`, nginx gửi lần lượt tới
+  # từng IP. Đây là lý do app phải stateless.
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - agent
+    restart: unless-stopped
 
 volumes:
   redis-data:
